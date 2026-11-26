@@ -21,6 +21,8 @@ from email.message import EmailMessage
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
+from notifications import NotificationChannel, SlackBotChannel
+
 PORT = int(os.environ.get("PORT", "8080"))
 APP_ORIGIN = os.environ.get("APP_ORIGIN", "").rstrip("/")
 CLIENT_ID = os.environ.get("LINEAR_CLIENT_ID", "")
@@ -30,6 +32,10 @@ PRIMARY_APPROVER = os.environ.get("PRIMARY_APPROVER_EMAIL", "").lower()
 SECONDARY_APPROVER = os.environ.get("SECONDARY_APPROVER_EMAIL", "").lower()
 PRIMARY_APPROVER_NAME = os.environ.get("PRIMARY_APPROVER_NAME", "初审人")
 SECONDARY_APPROVER_NAME = os.environ.get("SECONDARY_APPROVER_NAME", "终审人")
+SLACK_BOT_TOKEN = os.environ.get("SLACK_BOT_TOKEN", "").strip()
+APPROVAL_NOTIFICATION_CHANNELS: tuple[NotificationChannel, ...] = (
+    (SlackBotChannel(SLACK_BOT_TOKEN),) if SLACK_BOT_TOKEN else ()
+)
 INDEX_HTML = Path(__file__).with_name("index.html").read_text(encoding="utf-8")
 DATA_DIR = Path(__file__).with_name("data")
 DATA_DIR.mkdir(exist_ok=True)
@@ -400,6 +406,24 @@ def queue_email(recipient, subject, body):
         return False
 
 
+def notify_approver(request_id, status, applicant_name, start_date, end_date):
+    approver = {
+        "pending_primary": (PRIMARY_APPROVER, "初审"),
+        "pending_secondary": (SECONDARY_APPROVER, "终审"),
+    }.get(status)
+    if not approver or not APPROVAL_NOTIFICATION_CHANNELS:
+        return
+
+    recipient, stage = approver
+    message = f"请假申请 #{request_id} 待{stage}\n申请人：{applicant_name}\n日期：{start_date} 至 {end_date}"
+    action_url = f"{APP_ORIGIN}/admin" if APP_ORIGIN else ""
+    for channel in APPROVAL_NOTIFICATION_CHANNELS:
+        try:
+            channel.send(recipient, message, action_url)
+        except Exception as error:
+            print(f"审批通知发送失败（申请 #{request_id}，{stage}，{type(channel).__name__}） {error}", flush=True)
+
+
 init_db()
 
 
@@ -618,6 +642,7 @@ async function decide(id,status,stage){const r=await fetch('/api/admin/requests/
                         "UPDATE leave_requests SET attachment_name=?,attachment_path=?,attachment_type=?,attachment_size=? WHERE id=?",
                         (attachment_name, stored_name, attachment_type, len(attachment_bytes), request_id),
                     )
+            notify_approver(request_id, "pending_primary", user["name"], start_date, end_date)
             queue_email(user["email"], "请假申请已提交", f"{user['name']}，你的{body['leave_type']}申请（{start_date.isoformat()} {start_period} 至 {end_date.isoformat()} {end_period}，共 {leave_days:g} 天）已提交，当前等待 {PRIMARY_APPROVER_NAME} 初审。")
             return self.json(201, {"id": request_id, "status": "pending_primary"})
         if user.get("role") != "admin":
@@ -705,6 +730,7 @@ async function decide(id,status,stage){const r=await fetch('/api/admin/requests/
                         (leave_days, employee_id),
                     )
                 created = dict(connection.execute("SELECT * FROM leave_requests WHERE id=?", (request_id,)).fetchone())
+            notify_approver(request_id, status, target_user["name"], start_date, end_date)
             status_text = {
                 "pending_primary": f"待 {PRIMARY_APPROVER_NAME} 初审",
                 "pending_secondary": f"待 {SECONDARY_APPROVER_NAME} 终审",
@@ -770,6 +796,8 @@ async function decide(id,status,stage){const r=await fetch('/api/admin/requests/
             notification = None
             with db() as connection:
                 request_id = int(parts[3])
+                # Serialize the stage read and update before sending a notice.
+                connection.execute("BEGIN IMMEDIATE")
                 leave = connection.execute("SELECT r.*,u.name,u.email FROM leave_requests r JOIN users u ON u.linear_id=r.user_id WHERE r.id=?", (request_id,)).fetchone()
                 if not leave:
                     return self.json(404, {"error": "request_not_found"})
@@ -802,6 +830,7 @@ async function decide(id,status,stage){const r=await fetch('/api/admin/requests/
                     notification = (leave["email"], "请假申请终审状态更新", f"{leave['name']}，你的{leave['leave_type']}申请（{leave['start_date']} 至 {leave['end_date']}）{status_text}。")
                 else:
                     return self.json(400, {"error": "already_processed"})
+            notify_approver(request_id, next_status, leave["name"], leave["start_date"], leave["end_date"])
             if notification:
                 queue_email(*notification)
             return self.json(200, {"ok": True})
@@ -833,8 +862,8 @@ async function decide(id,status,stage){const r=await fetch('/api/admin/requests/
             reason = str(body.get("reason", "")).strip()[:1000]
             handover = str(body.get("handover", "")).strip()[:100]
             active_statuses = ("pending_primary", "pending_secondary", "approved")
-            notification = None
             with db() as connection:
+                connection.execute("BEGIN IMMEDIATE")
                 existing = connection.execute("SELECT * FROM leave_requests WHERE id=?", (request_id,)).fetchone()
                 if not existing:
                     return self.json(404, {"error": "request_not_found"})
@@ -888,11 +917,14 @@ async function decide(id,status,stage){const r=await fetch('/api/admin/requests/
                 if abs(annual_delta) > 1e-9:
                     connection.execute("UPDATE users SET annual_leave_used=MAX(0,COALESCE(annual_leave_used,0)+?) WHERE linear_id=?", (annual_delta, existing["user_id"]))
                 updated = dict(connection.execute("SELECT * FROM leave_requests WHERE id=?", (request_id,)).fetchone())
-                if status != existing["status"]:
-                    status_text = {"pending_primary": f"待 {PRIMARY_APPROVER_NAME} 初审", "pending_secondary": f"待 {SECONDARY_APPROVER_NAME} 终审", "approved": "终审已通过", "rejected": "已驳回"}[status]
-                    notification = (target_user["email"], "请假申请状态已由管理员更新", f"{target_user['name']}，你的{leave_type}申请（{start_date.isoformat()} {start_period} 至 {end_date.isoformat()} {end_period}）状态已更新为：{status_text}。")
-            if notification:
-                queue_email(*notification)
+            if status != existing["status"]:
+                notify_approver(request_id, status, target_user["name"], start_date, end_date)
+                status_text = {"pending_primary": f"待 {PRIMARY_APPROVER_NAME} 初审", "pending_secondary": f"待 {SECONDARY_APPROVER_NAME} 终审", "approved": "终审已通过", "rejected": "已驳回"}[status]
+                queue_email(
+                    target_user["email"],
+                    "请假申请状态已由管理员更新",
+                    f"{target_user['name']}，你的{leave_type}申请（{start_date.isoformat()} {start_period} 至 {end_date.isoformat()} {end_period}）状态已更新为：{status_text}。",
+                )
             return self.json(200, {"request": updated})
         if len(parts) == 5 and parts[:3] == ["api", "admin", "users"] and parts[4] == "profile":
             target = urllib.parse.unquote(parts[3])

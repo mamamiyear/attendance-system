@@ -35,6 +35,7 @@ function tarEntry(name, content, mode = 0o644) {
 const sourceFiles = [
   ["./boxlite-app/index.html", "qingjia-app/index.html"],
   ["./boxlite-app/server.py", "qingjia-app/server.py"],
+  ["./boxlite-app/notifications.py", "qingjia-app/notifications.py"],
   ["./boxlite-app/verify_workflow.py", "qingjia-app/verify_workflow.py"],
   ["./boxlite-app/verify_employee_admin.py", "qingjia-app/verify_employee_admin.py"],
   ["./qingjia-sleep-wrapper", "qingjia-sleep-wrapper", 0o755],
